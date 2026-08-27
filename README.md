@@ -2,8 +2,6 @@
 
 Official implementation for **Continual Alignment for SAM: Rethinking Foundation Models for Medical Image Segmentation in Continual Learning**, accepted to **CVPR 2026 Findings**.
 
-Paper page: https://cvpr.thecvf.com/virtual/2026/poster/41240
-
 This repository contains the source code for the CA-SAM training and VAE-router evaluation pipeline. It does not include medical datasets, SAM checkpoints, trained adapters, trained VAEs, or patient data. Users should obtain datasets and checkpoints from their official sources and follow their licenses.
 
 ## Method Overview
@@ -31,8 +29,7 @@ At inference time, the frozen SAM encoder feature is pooled into a vector, all t
 ├── CL/                                # VAE router and adapter utilities
 ├── segment_anything/                  # SAM model code plus Alignment Layer modules
 ├── DATA_PREPARATION.md                # Expected dataset structure
-├── requirements.txt                   # Minimal dependency list
-└── requirements-full.txt              # Full environment snapshot from experiments
+└── requirements.txt                   # Minimal dependency list
 ```
 
 ## Environment
@@ -142,17 +139,6 @@ s_t <= tau_t  -> use task Alignment Layer
 s_t >  tau_t  -> use identity alignment fallback
 ```
 
-## Citation
-
-```bibtex
-@InProceedings{Wang_2026_CVPR,
-  author    = {Wang, Jiayi and Dai, Wei and Wang, Haoyu and Yang, Sihan and Bi, Haixia and Sun, Jian},
-  title     = {Continual Alignment for SAM: Rethinking Foundation Models for Medical Image Segmentation in Continual Learning},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Findings},
-  month     = {June},
-  year      = {2026}
-}
-```
 
 ## License
 
