@@ -1,113 +1,117 @@
-# CA-SAM 56Nx → DN reproduction
+# Shared Alignment Layer pilot: 56Nx → DN
 
-This directory runs the released CA-SAM implementation on the two-task
-KPIs2024 sequence `56Nx → DN`. It is an experiment wrapper, not a new method.
-It does not modify the CA-SAM model implementation.
+This experiment measures forgetting and plasticity when **one Alignment Layer** is
+updated sequentially on `56Nx` and then `DN`. It deliberately does not use the
+official CA-SAM task-specific adapter bank or VAE router.
 
-## Scope
+The frozen SAM backbone is reconstructed from the same base checkpoint for every
+training/evaluation process. Only the CNN-3 Alignment Layer is trainable.
 
-- T1: train the task-specific CNN-3 Alignment Layer and VAE router for 56Nx.
-- T2: train the task-specific CNN-3 Alignment Layer and VAE router for DN.
-- Evaluate T1 with the 56Nx router/adaptor set.
-- Evaluate T2 with both 56Nx and DN visible to the router.
-- Save stage-wise IoU and BIoU matrices, logs, checkpoints, tau statistics,
-  environment details, and the exact Git revision.
+## Experiment design
 
-This reproduces the CA-SAM task-specific-adapter baseline. It does not measure
-shared-parameter catastrophic forgetting and does not implement SR²-LoRA.
+| Run | Initialization | Training | Saved model | Evaluation |
+| --- | --- | --- | --- | --- |
+| A | fresh SAM + fresh AL | 56Nx, 24 epochs | `M_56Nx.pth` | 56Nx (`56Nx_before`) |
+| B | fresh frozen SAM + **load `M_56Nx` into the AL** | DN, 24 epochs | `M_56Nx_DN.pth` | DN (`DN_sequential`) and 56Nx (`56Nx_after_DN`) |
+| C | fresh SAM + fresh AL | DN, 24 epochs | `M_DN_only.pth` | DN (`DN_only`) |
+
+Run B starts from the exact Alignment Layer state produced by Run A. The runner
+records the source checkpoint SHA-256 beside `M_56Nx_DN.pth` so that this link is
+auditable. The optimizer is newly constructed for each training stage; no replay,
+router, or task-specific adapter selection is used.
+
+For each metric (`iou`, `dice`, and `biou`) the summary reports:
+
+```text
+forgetting     = 56Nx_before - 56Nx_after_DN
+plasticity_gap = DN_only - DN_sequential
+```
+
+IoU is also exposed as the primary top-level result in `summary.json`.
 
 ## UCloud setup
 
-Create the Python environment and install the CA-SAM requirements. Download the
-official SAM ViT-B checkpoint separately. If `/mnt/ufs/Med_datasets` has not
-been generated yet, first follow `docs/KPIS2024_PREPARATION.md` and run
-`scripts/prepare_kpis2024_for_casam.py`; the same preparation command is safe to
-rerun on UCloud. Then set paths:
+From the repository root:
 
 ```bash
-cd /path/to/CA_SAM_Task2
-cp experiments/kpis56nx_dn/ucloud.env.example /tmp/casam-ucloud.env
-nano /tmp/casam-ucloud.env
-source /tmp/casam-ucloud.env
+cp experiments/kpis56nx_dn/ucloud.env.example /tmp/casam-shared-al.env
+vi /tmp/casam-shared-al.env
+source /tmp/casam-shared-al.env
 ```
 
-The default formal configuration follows the repository launcher:
+`CASAM_DATA_DIR` defaults to `/mnt/ufs/Med_datasets`. The SAM checkpoint can be
+set with `CASAM_SAM_CKPT` or passed explicitly with `--sam-checkpoint`.
 
-```text
-method=cnn, num_cnn=3, epochs=24, lr=1e-4
-train_batch_size=6, eval_batch_size=1
-image_size=1024, mask_num=5
-router=VAE, feature=attn_pool, in_dim=256, latent_dim=64
-vae_beta=16.5, vae_epochs=10, vae_lr=5e-4
-tau=5-fold held-out p97
-```
+## Validate, smoke-test, and run
 
-## Execution order
-
-Run each gate separately so a failed smoke test cannot silently start a long
-training run:
+Run the strict data/checkpoint/environment validation first:
 
 ```bash
 python experiments/kpis56nx_dn/run_experiment.py preflight
-python experiments/kpis56nx_dn/run_experiment.py smoke
-python experiments/kpis56nx_dn/run_experiment.py train
-python experiments/kpis56nx_dn/run_experiment.py eval
 ```
 
-Or, after the preflight has already been inspected:
+The smoke test executes all three training stages, verifies the Run A → Run B
+checkpoint hand-off, evaluates four small test subsets, and writes a summary:
+
+```bash
+python experiments/kpis56nx_dn/run_experiment.py smoke
+```
+
+Run the complete 24-epoch pilot and all evaluations:
 
 ```bash
 python experiments/kpis56nx_dn/run_experiment.py all
 ```
 
-The runner repeats preflight validation before each operation unless
-`--skip-preflight` is explicitly supplied.
-
-## GPU-memory overrides
-
-Start with the official batch size. If CUDA reports out-of-memory, reduce only
-the training batch size first and record the override:
+The stages can also be resumed separately. Existing completed artifacts are
+skipped unless `--force` is supplied:
 
 ```bash
-python experiments/kpis56nx_dn/run_experiment.py train \
-  --train-batch-size 2
+python experiments/kpis56nx_dn/run_experiment.py train
+python experiments/kpis56nx_dn/run_experiment.py eval
+python experiments/kpis56nx_dn/run_experiment.py summarize
 ```
 
-Do not silently change `image-size`, `mask-num`, the task order, or router
-configuration for a claimed paper reproduction.
+Common overrides:
 
-## Resume behavior
+```bash
+python experiments/kpis56nx_dn/run_experiment.py all \
+  --data-dir /mnt/ufs/Med_datasets \
+  --sam-checkpoint /mnt/ufs/checkpoints/sam_vit_b_01ec64.pth \
+  --run-root /mnt/ufs/CA_SAM_runs/56nx_dn_shared \
+  --cuda-visible-devices 0 \
+  --device cuda:0
+```
 
-Training skips a task only when its adapter, VAE, and `tau.json` all exist. A
-partially completed task is rerun. If an existing run was created with different
-settings, the runner stops instead of relabelling old artifacts; choose a new
-run root or use `--force` intentionally. Every evaluation uses a new timestamped
-directory by default, avoiding duplicate CSV rows.
+## Outputs
 
-## Results
-
-Outputs are written below `$CASAM_RUN_ROOT`:
+With the example environment, the complete run is stored under:
 
 ```text
-preflight.json
-smoke/
-train/vae_router_cnn_cnn3/
-├── adapters_ckpt/{56Nx,DN}/
-├── vaes_ckpt/{56Nx,DN}/
+/mnt/ufs/CA_SAM_runs/56nx_dn_shared/shared_al_cnn3/
+├── experiment_config.json
 ├── checkpoints/
-├── logs/
-└── driver_logs/
-eval/<timestamp>/
-├── cl_metrics/
-└── driver_logs/
+│   ├── M_56Nx.pth
+│   ├── M_56Nx.json
+│   ├── M_56Nx_DN.pth
+│   ├── M_56Nx_DN.json
+│   ├── M_DN_only.pth
+│   └── M_DN_only.json
+├── stages/
+│   ├── run_a_56Nx/
+│   ├── run_b_56Nx_to_DN/
+│   └── run_c_DN_only/
+├── driver_logs/
+└── results/
+    ├── raw/
+    │   ├── 56Nx_before.json
+    │   ├── 56Nx_after_DN.json
+    │   ├── DN_sequential.json
+    │   └── DN_only.json
+    ├── summary.json
+    ├── summary.csv
+    └── summary.md
 ```
 
-Render the two metric matrices as one Markdown table:
-
-```bash
-python experiments/kpis56nx_dn/summarize_results.py \
-  "$CASAM_RUN_ROOT/eval/<timestamp>"
-```
-
-Keep the generated outputs outside Git. The repository `.gitignore` already
-excludes the default `outputs/`, checkpoints, `.pth`, `.npy`, and `.npz` files.
+Smoke-test artifacts are isolated under `smoke_shared_al/` and cannot be mistaken
+for full-run results.

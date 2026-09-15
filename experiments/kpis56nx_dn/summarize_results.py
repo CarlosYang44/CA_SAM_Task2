@@ -1,46 +1,27 @@
 #!/usr/bin/env python3
-"""Render CA-SAM 56Nx -> DN IoU/BIoU CSV files as a Markdown table."""
+"""Print an existing shared-AL summary as a compact Markdown table."""
 
 from __future__ import annotations
 
 import argparse
-import csv
+import json
 from pathlib import Path
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("evaluation_dir", type=Path)
-    return parser.parse_args()
-
-
-def read_metric(path: Path) -> dict[str, dict[str, str]]:
-    with path.open(newline="", encoding="utf-8") as source:
-        rows = list(csv.DictReader(source))
-    return {row["Task"]: row for row in rows}
-
-
-def show(value: str | None) -> str:
-    if value in (None, ""):
-        return "—"
-    return f"{float(value):.4f}"
-
-
 def main() -> int:
-    args = parse_args()
-    metrics = args.evaluation_dir / "cl_metrics"
-    iou = read_metric(metrics / "casam_56nx_dn_iou.csv")
-    biou = read_metric(metrics / "casam_56nx_dn_biou.csv")
-    print("| Stage | 56Nx IoU | DN IoU | Avg IoU | 56Nx BIoU | DN BIoU | Avg BIoU |")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("experiment_dir", type=Path)
+    args = parser.parse_args()
+    path = args.experiment_dir / "results" / "summary.json"
+    with path.open(encoding="utf-8") as source:
+        summary = json.load(source)
+    print("| Metric | 56Nx before | 56Nx after DN | DN sequential | DN only | Forgetting | Plasticity gap |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
-    for stage, name in (("0", "T1 56Nx"), ("1", "T2 DN")):
-        if stage not in iou or stage not in biou:
-            continue
+    for metric, values in summary["by_metric"].items():
         print(
-            f"| {name} | {show(iou[stage].get('56Nx'))} | "
-            f"{show(iou[stage].get('DN'))} | {show(iou[stage].get('Avg'))} | "
-            f"{show(biou[stage].get('56Nx'))} | {show(biou[stage].get('DN'))} | "
-            f"{show(biou[stage].get('Avg'))} |"
+            f"| {metric} | {values['56Nx_before']:.4f} | {values['56Nx_after_DN']:.4f} | "
+            f"{values['DN_sequential']:.4f} | {values['DN_only']:.4f} | "
+            f"{values['forgetting']:.4f} | {values['plasticity_gap']:.4f} |"
         )
     return 0
 
