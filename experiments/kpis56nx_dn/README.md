@@ -115,3 +115,38 @@ With the example environment, the complete run is stored under:
 
 Smoke-test artifacts are isolated under `smoke_shared_al/` and cannot be mistaken
 for full-run results.
+
+## Cross-modality pilot: 56Nx → MSD_Spleen
+
+The same runner can use `MSD_Spleen` as the second task. The public MSD test set
+does not include labels, so the preparation script creates a deterministic
+patient-level split from the 41 labelled Task09 volumes. It keeps spleen-positive
+axial slices and selects 876 training and 146 test slices, matching the counts
+reported by CA-SAM. The generated manifest records the exact case split, CT
+window, and selected-slice procedure; this is a reproducible local split, not a
+claim to reproduce an unpublished patient split from the paper.
+
+Prepare the data on a CPU instance:
+
+```bash
+pip install nibabel==5.3.2
+
+python scripts/prepare_msd_spleen_for_casam.py \
+  --raw-root /mnt/ufs/Med_datasets/raw/Task09_Spleen \
+  --output-root /mnt/ufs/Med_datasets
+```
+
+On the GPU instance, reuse the completed Run-A checkpoint from the 56Nx → DN
+pilot and run only the new sequential and target-only training stages:
+
+```bash
+python experiments/kpis56nx_dn/run_experiment.py all \
+  --second-dataset MSD_Spleen \
+  --initial-56nx-checkpoint \
+    /home/ubuntu/CA_SAM/outputs/kpis56nx_dn_shared/shared_al_cnn3/checkpoints/M_56Nx.pth \
+  --run-root /home/ubuntu/CA_SAM/outputs/kpis56nx_spleen_shared
+```
+
+Use the same arguments with `smoke` before the full run. The resulting summary
+reports `56Nx_before`, `56Nx_after_MSD_Spleen`, `MSD_Spleen_sequential`,
+`MSD_Spleen_only`, forgetting, and plasticity gap.

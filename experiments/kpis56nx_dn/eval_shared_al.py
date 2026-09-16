@@ -27,7 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a fixed shared Alignment Layer; no VAE/router is constructed."
     )
-    parser.add_argument("--dataset-name", required=True, choices=("56Nx", "DN"))
+    parser.add_argument(
+        "--dataset-name", required=True, choices=("56Nx", "DN", "MSD_Spleen")
+    )
     parser.add_argument("--align-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, required=True)

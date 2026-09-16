@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the shared-Alignment-Layer 56Nx -> DN forgetting pilot."""
+"""Run a shared-Alignment-Layer 56Nx -> target forgetting pilot."""
 
 from __future__ import annotations
 
@@ -17,22 +17,35 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-TASKS = ("56Nx", "DN")
 FULL_EPOCHS = 24
 EXPECTED = {
     "56Nx": {"training": 558, "test": 463},
     "DN": {"training": 724, "test": 391},
+    "MSD_Spleen": {"training": 876, "test": 146},
 }
 REQUIRED_PACKAGES = (
-    "torch", "torchvision", "monai", "numpy", "cv2", "PIL", "scipy", "skimage", "tqdm",
+    "torch", "torchvision", "monai", "numpy", "cv2", "PIL", "scipy", "skimage",
+    "tqdm",
 )
-MODEL_NAMES = ("M_56Nx", "M_56Nx_DN", "M_DN_only")
-EVALUATIONS = {
-    "56Nx_before": ("56Nx", "M_56Nx"),
-    "DN_sequential": ("DN", "M_56Nx_DN"),
-    "56Nx_after_DN": ("56Nx", "M_56Nx_DN"),
-    "DN_only": ("DN", "M_DN_only"),
-}
+
+
+def tasks(args: argparse.Namespace) -> tuple[str, str]:
+    return "56Nx", args.second_dataset
+
+
+def model_names(args: argparse.Namespace) -> tuple[str, str, str]:
+    target = args.second_dataset
+    return "M_56Nx", f"M_56Nx_{target}", f"M_{target}_only"
+
+
+def evaluations(args: argparse.Namespace) -> dict[str, tuple[str, str]]:
+    target = args.second_dataset
+    return {
+        "56Nx_before": ("56Nx", "M_56Nx"),
+        f"{target}_sequential": (target, f"M_56Nx_{target}"),
+        f"56Nx_after_{target}": ("56Nx", f"M_56Nx_{target}"),
+        f"{target}_only": (target, f"M_{target}_only"),
+    }
 
 
 def env_path(name: str, default: str) -> Path:
@@ -41,7 +54,7 @@ def env_path(name: str, default: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the shared-AL 56Nx -> DN forgetting/plasticity pilot."
+        description="Run the shared-AL 56Nx -> target forgetting/plasticity pilot."
     )
     parser.add_argument(
         "command", choices=("preflight", "smoke", "train", "eval", "summarize", "all")
@@ -57,6 +70,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-root", type=Path,
         default=env_path("CASAM_RUN_ROOT", "./outputs/kpis56nx_dn_shared"),
+    )
+    parser.add_argument(
+        "--second-dataset", choices=("DN", "MSD_Spleen"), default="DN",
+        help="Task learned after 56Nx (default: DN).",
+    )
+    parser.add_argument(
+        "--initial-56nx-checkpoint", type=Path, default=None,
+        help="Reuse an existing M_56Nx checkpoint instead of retraining Run A.",
     )
     parser.add_argument("--device", default=os.environ.get("CASAM_DEVICE", "cuda:0"))
     parser.add_argument(
@@ -187,14 +208,17 @@ def preflight(args: argparse.Namespace) -> dict:
     data_dir = args.data_dir.resolve()
     checkpoint = args.sam_checkpoint.resolve()
     run_root = args.run_root.resolve()
-    missing_packages = [p for p in REQUIRED_PACKAGES if importlib.util.find_spec(p) is None]
+    required_packages = REQUIRED_PACKAGES + (
+        ("nibabel",) if args.second_dataset == "MSD_Spleen" else ()
+    )
+    missing_packages = [p for p in required_packages if importlib.util.find_spec(p) is None]
     if missing_packages:
         raise RuntimeError("Missing Python packages: " + ", ".join(missing_packages))
     if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
         raise FileNotFoundError(f"SAM checkpoint not found: {checkpoint}")
 
     dataset_report: dict[str, object] = {}
-    for dataset in TASKS:
+    for dataset in tasks(args):
         metadata = read_dataset_metadata(data_dir, dataset)
         counts = {split: len(metadata.get(split, [])) for split in ("training", "test")}
         if counts != EXPECTED[dataset]:
@@ -240,8 +264,8 @@ def checkpoint_path(root: Path, model_name: str) -> Path:
 
 def stable_config(args: argparse.Namespace, smoke_run: bool) -> dict:
     return {
-        "design": "shared_alignment_layer_56Nx_then_DN",
-        "task_order": list(TASKS), "router": "disabled", "method": "cnn",
+        "design": f"shared_alignment_layer_56Nx_then_{args.second_dataset}",
+        "task_order": list(tasks(args)), "router": "disabled", "method": "cnn",
         "num_cnn": args.num_cnn, "epochs_per_stage": 1 if smoke_run else FULL_EPOCHS,
         "lr": args.lr, "train_batch_size": 1 if smoke_run else args.train_batch_size,
         "eval_batch_size": 1 if smoke_run else args.eval_batch_size,
@@ -251,6 +275,10 @@ def stable_config(args: argparse.Namespace, smoke_run: bool) -> dict:
         "dataset_scale": args.smoke_dataset_scale if smoke_run else 1.0,
         "data_dir": str(args.data_dir.resolve()),
         "sam_checkpoint": str(args.sam_checkpoint.resolve()),
+        "initial_56Nx_checkpoint": (
+            str(args.initial_56nx_checkpoint.resolve())
+            if args.initial_56nx_checkpoint is not None else None
+        ),
         "git_revision": git_revision(repository_root()),
     }
 
@@ -278,7 +306,7 @@ def train_command(
         "--work_dir", str(stage_dir), "--save_root", str(stage_dir),
         "--ckpt_dir", str(stage_dir / "checkpoint"),
         "--run_name", stage_dir.name, "--dataset_name", dataset,
-        "--all_datasets", ",".join(TASKS), "--device", args.device,
+        "--all_datasets", ",".join(tasks(args)), "--device", args.device,
         "--model_type", "vit_b", "--sam_checkpoint", str(args.sam_checkpoint.resolve()),
         "--data_dir", str(args.data_dir.resolve()), "--method", "cnn",
         "--num_cnn", str(args.num_cnn), "--lr", str(args.lr),
@@ -337,16 +365,50 @@ def train_stage(
     return destination
 
 
+def obtain_m_56nx(args: argparse.Namespace, root: Path, smoke_run: bool) -> Path:
+    """Train Run A, or import a previously trained Run-A checkpoint."""
+    if args.initial_56nx_checkpoint is None:
+        return train_stage(
+            args, root, "run_a_56Nx", "56Nx", "M_56Nx", smoke_run
+        )
+
+    source = args.initial_56nx_checkpoint.resolve()
+    if not source.is_file() or source.stat().st_size == 0:
+        raise FileNotFoundError(f"Initial 56Nx checkpoint not found: {source}")
+    destination = checkpoint_path(root, "M_56Nx")
+    if destination.is_file() and not args.force:
+        if sha256(destination) != sha256(source):
+            raise RuntimeError(
+                f"Existing {destination} differs from --initial-56nx-checkpoint; "
+                "use another --run-root or --force"
+            )
+        print(f"M_56Nx already imported; skipping: {destination}")
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    atomic_json(root / "checkpoints" / "M_56Nx.json", {
+        "created_utc": utc_now(), "model": "M_56Nx", "dataset": "56Nx",
+        "imported_from": str(source), "source_sha256": sha256(source),
+        "checkpoint": str(destination), "sha256": sha256(destination),
+        "router": "disabled",
+    })
+    print(f"imported M_56Nx: {source} -> {destination}")
+    return destination
+
+
 def train(args: argparse.Namespace, smoke_run: bool = False) -> Path:
     root = experiment_root(args, smoke_run)
     root.mkdir(parents=True, exist_ok=True)
     ensure_config(args, root, smoke_run)
-    m_56nx = train_stage(args, root, "run_a_56Nx", "56Nx", "M_56Nx", smoke_run)
+    target = args.second_dataset
+    m_56nx = obtain_m_56nx(args, root, smoke_run)
     train_stage(
-        args, root, "run_b_56Nx_to_DN", "DN", "M_56Nx_DN", smoke_run,
+        args, root, f"run_b_56Nx_to_{target}", target, f"M_56Nx_{target}", smoke_run,
         initialize_from=m_56nx,
     )
-    train_stage(args, root, "run_c_DN_only", "DN", "M_DN_only", smoke_run)
+    train_stage(
+        args, root, f"run_c_{target}_only", target, f"M_{target}_only", smoke_run
+    )
     return root
 
 
@@ -373,10 +435,10 @@ def eval_command(
 
 def evaluate(args: argparse.Namespace, smoke_run: bool = False) -> Path:
     root = experiment_root(args, smoke_run)
-    for model_name in MODEL_NAMES:
+    for model_name in model_names(args):
         if not checkpoint_path(root, model_name).is_file():
             raise FileNotFoundError(f"Cannot evaluate; missing {checkpoint_path(root, model_name)}")
-    for result_name, (dataset, model_name) in EVALUATIONS.items():
+    for result_name, (dataset, model_name) in evaluations(args).items():
         evaluate_one(args, root, result_name, dataset, model_name, smoke_run)
     return root
 
@@ -401,25 +463,31 @@ def evaluate_one(
     return output
 
 
-def summarize(root: Path) -> Path:
+def summarize(root: Path, target: str = "DN") -> Path:
+    result_map = {
+        "before": "56Nx_before",
+        "after": f"56Nx_after_{target}",
+        "sequential": f"{target}_sequential",
+        "only": f"{target}_only",
+    }
     raw: dict[str, dict] = {}
-    for name in EVALUATIONS:
+    for name in result_map.values():
         path = root / "results" / "raw" / f"{name}.json"
         if not path.is_file():
             raise FileNotFoundError(f"Cannot summarize; missing {path}")
         with path.open(encoding="utf-8") as source:
             raw[name] = json.load(source)
 
-    metric_names = list(raw["56Nx_before"]["metrics"])
+    metric_names = list(raw[result_map["before"]]["metrics"])
     by_metric = {}
     for metric in metric_names:
-        before = float(raw["56Nx_before"]["metrics"][metric])
-        after = float(raw["56Nx_after_DN"]["metrics"][metric])
-        sequential = float(raw["DN_sequential"]["metrics"][metric])
-        only = float(raw["DN_only"]["metrics"][metric])
+        before = float(raw[result_map["before"]]["metrics"][metric])
+        after = float(raw[result_map["after"]]["metrics"][metric])
+        sequential = float(raw[result_map["sequential"]]["metrics"][metric])
+        only = float(raw[result_map["only"]]["metrics"][metric])
         by_metric[metric] = {
-            "56Nx_before": before, "56Nx_after_DN": after,
-            "DN_sequential": sequential, "DN_only": only,
+            "56Nx_before": before, f"56Nx_after_{target}": after,
+            f"{target}_sequential": sequential, f"{target}_only": only,
             "forgetting": round(before - after, 10),
             "plasticity_gap": round(only - sequential, 10),
         }
@@ -430,7 +498,8 @@ def summarize(root: Path) -> Path:
     results = root / "results"
     atomic_json(results / "summary.json", summary)
     columns = (
-        "metric", "56Nx_before", "56Nx_after_DN", "DN_sequential", "DN_only",
+        "metric", "56Nx_before", f"56Nx_after_{target}",
+        f"{target}_sequential", f"{target}_only",
         "forgetting", "plasticity_gap",
     )
     with (results / "summary.csv").open("w", newline="", encoding="utf-8") as output:
@@ -439,12 +508,17 @@ def summarize(root: Path) -> Path:
         for metric, values in by_metric.items():
             writer.writerow({"metric": metric, **values})
     with (results / "summary.md").open("w", encoding="utf-8", newline="\n") as output:
-        output.write("| Metric | 56Nx before | 56Nx after DN | DN sequential | DN only | Forgetting | Plasticity gap |\n")
+        output.write(
+            f"| Metric | 56Nx before | 56Nx after {target} | {target} sequential | "
+            f"{target} only | Forgetting | Plasticity gap |\n"
+        )
         output.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
         for metric, values in by_metric.items():
             output.write(
-                f"| {metric} | {values['56Nx_before']:.4f} | {values['56Nx_after_DN']:.4f} | "
-                f"{values['DN_sequential']:.4f} | {values['DN_only']:.4f} | "
+                f"| {metric} | {values['56Nx_before']:.4f} | "
+                f"{values[f'56Nx_after_{target}']:.4f} | "
+                f"{values[f'{target}_sequential']:.4f} | "
+                f"{values[f'{target}_only']:.4f} | "
                 f"{values['forgetting']:.4f} | {values['plasticity_gap']:.4f} |\n"
             )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -458,19 +532,26 @@ def run_pipeline(args: argparse.Namespace, smoke_run: bool = False) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     ensure_config(args, root, smoke_run)
 
-    m_56nx = train_stage(args, root, "run_a_56Nx", "56Nx", "M_56Nx", smoke_run)
+    target = args.second_dataset
+    m_56nx = obtain_m_56nx(args, root, smoke_run)
     evaluate_one(args, root, "56Nx_before", "56Nx", "M_56Nx", smoke_run)
 
     train_stage(
-        args, root, "run_b_56Nx_to_DN", "DN", "M_56Nx_DN", smoke_run,
+        args, root, f"run_b_56Nx_to_{target}", target, f"M_56Nx_{target}", smoke_run,
         initialize_from=m_56nx,
     )
-    evaluate_one(args, root, "DN_sequential", "DN", "M_56Nx_DN", smoke_run)
-    evaluate_one(args, root, "56Nx_after_DN", "56Nx", "M_56Nx_DN", smoke_run)
+    evaluate_one(
+        args, root, f"{target}_sequential", target, f"M_56Nx_{target}", smoke_run
+    )
+    evaluate_one(
+        args, root, f"56Nx_after_{target}", "56Nx", f"M_56Nx_{target}", smoke_run
+    )
 
-    train_stage(args, root, "run_c_DN_only", "DN", "M_DN_only", smoke_run)
-    evaluate_one(args, root, "DN_only", "DN", "M_DN_only", smoke_run)
-    summarize(root)
+    train_stage(
+        args, root, f"run_c_{target}_only", target, f"M_{target}_only", smoke_run
+    )
+    evaluate_one(args, root, f"{target}_only", target, f"M_{target}_only", smoke_run)
+    summarize(root, target)
     return root
 
 
@@ -483,6 +564,8 @@ def main() -> int:
     args.data_dir = args.data_dir.expanduser()
     args.sam_checkpoint = args.sam_checkpoint.expanduser()
     args.run_root = args.run_root.expanduser()
+    if args.initial_56nx_checkpoint is not None:
+        args.initial_56nx_checkpoint = args.initial_56nx_checkpoint.expanduser()
     if args.command == "preflight":
         preflight(args)
         return 0
@@ -495,7 +578,7 @@ def main() -> int:
     elif args.command == "eval":
         evaluate(args)
     elif args.command == "summarize":
-        summarize(experiment_root(args))
+        summarize(experiment_root(args), args.second_dataset)
     elif args.command == "all":
         run_pipeline(args)
     return 0
