@@ -90,7 +90,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--mask-num", type=int, default=5)
     parser.add_argument("--num-cnn", type=int, default=3)
-    parser.add_argument("--fold-seed", type=int, default=2025)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fold-seed", type=int, default=42)
+    parser.add_argument(
+        "--continual-method", choices=("naive", "sr2"), default="naive",
+        help="Run B update rule. sr2 adds singular-value inter-layer relation alignment.",
+    )
+    parser.add_argument("--sr2-lambda", type=float, default=1.0)
     parser.add_argument("--smoke-dataset-scale", type=float, default=0.02)
     parser.add_argument("--smoke-image-size", type=int, default=256)
     parser.add_argument("--smoke-eval-samples", type=int, default=4)
@@ -249,12 +255,16 @@ def preflight(args: argparse.Namespace) -> dict:
 def driver_environment(args: argparse.Namespace) -> dict[str, str]:
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
-    environment.setdefault("PYTHONHASHSEED", str(args.fold_seed))
+    environment["PYTHONHASHSEED"] = str(args.seed)
     return environment
 
 
 def experiment_root(args: argparse.Namespace, smoke_run: bool = False) -> Path:
-    suffix = "smoke_shared_al" if smoke_run else f"shared_al_cnn{args.num_cnn}"
+    if args.continual_method == "sr2":
+        prefix = "smoke_sr2_shared_al" if smoke_run else f"sr2_shared_al_cnn{args.num_cnn}"
+        suffix = f"{prefix}_lambda{args.sr2_lambda:g}"
+    else:
+        suffix = "smoke_shared_al" if smoke_run else f"shared_al_cnn{args.num_cnn}"
     return args.run_root.resolve() / suffix
 
 
@@ -272,6 +282,8 @@ def stable_config(args: argparse.Namespace, smoke_run: bool) -> dict:
         "num_workers": args.num_workers,
         "image_size": args.smoke_image_size if smoke_run else args.image_size,
         "mask_num": 1 if smoke_run else args.mask_num,
+        "seed": args.seed, "continual_method": args.continual_method,
+        "sr2_lambda": args.sr2_lambda if args.continual_method == "sr2" else None,
         "dataset_scale": args.smoke_dataset_scale if smoke_run else 1.0,
         "data_dir": str(args.data_dir.resolve()),
         "sam_checkpoint": str(args.sam_checkpoint.resolve()),
@@ -317,10 +329,16 @@ def train_command(
         "--image_size", str(args.smoke_image_size if smoke_run else args.image_size),
         "--mask_num", str(1 if smoke_run else args.mask_num),
         "--dataset_scale", str(args.smoke_dataset_scale if smoke_run else 1.0),
-        "--router_type", "none",
+        "--router_type", "none", "--seed", str(args.seed),
+        "--fold_seed", str(args.fold_seed),
     ]
     if initialize_from is not None:
         command += ["--align_checkpoint", str(initialize_from)]
+        if args.continual_method == "sr2":
+            command += [
+                "--sr2_teacher_checkpoint", str(initialize_from),
+                "--sr2_lambda", str(args.sr2_lambda),
+            ]
     return command
 
 
@@ -427,6 +445,7 @@ def eval_command(
         "--num-workers", str(args.num_workers),
         "--image-size", str(args.smoke_image_size if smoke_run else args.image_size),
         "--mask-num", str(1 if smoke_run else args.mask_num),
+        "--seed", str(args.seed),
     ]
     if smoke_run:
         command += ["--max-samples", str(args.smoke_eval_samples)]
@@ -561,6 +580,10 @@ def smoke(args: argparse.Namespace) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.continual_method == "sr2" and args.num_cnn < 2:
+        raise ValueError("SR2 requires --num-cnn of at least 2")
+    if args.sr2_lambda < 0:
+        raise ValueError("--sr2-lambda must be non-negative")
     args.data_dir = args.data_dir.expanduser()
     args.sam_checkpoint = args.sam_checkpoint.expanduser()
     args.run_root = args.run_root.expanduser()

@@ -6,6 +6,7 @@ official CA-SAM task-specific adapter bank or VAE router.
 
 The frozen SAM backbone is reconstructed from the same base checkpoint for every
 training/evaluation process. Only the CNN-3 Alignment Layer is trainable.
+All pilot runs use training seed `42` by default.
 
 ## Experiment design
 
@@ -150,3 +151,36 @@ python experiments/kpis56nx_dn/run_experiment.py all \
 Use the same arguments with `smoke` before the full run. The resulting summary
 reports `56Nx_before`, `56Nx_after_MSD_Spleen`, `MSD_Spleen_sequential`,
 `MSD_Spleen_only`, forgetting, and plasticity gap.
+
+## SR2-style relation alignment
+
+The runner also provides an isolated `sr2` variant for Run B. It freezes a copy
+of `M_56Nx` as the teacher, extracts the normalized output of every CNN Alignment
+Block for both teacher and current AL on each current-task sample, builds the
+sample-wise inter-layer cosine-relation matrices, and aligns their singular
+values with Smooth L1 loss:
+
+```text
+loss = segmentation_loss + sr2_lambda * relation_loss
+```
+
+This transfers the inter-layer relation objective from SR2-LoRA to the shared
+CA-SAM Alignment Layer; it does not add task-specific LoRA branches or replay
+old-task data. Run A and Run C remain unchanged.
+
+Smoke-test the method on the cross-modality sequence:
+
+```bash
+python experiments/kpis56nx_dn/run_experiment.py smoke \
+  --second-dataset MSD_Spleen \
+  --continual-method sr2 \
+  --sr2-lambda 1.0 \
+  --seed 42 \
+  --initial-56nx-checkpoint \
+    /home/ubuntu/CA_SAM/outputs/kpis56nx_dn_shared/shared_al_cnn3/checkpoints/M_56Nx.pth \
+  --run-root /home/ubuntu/CA_SAM/outputs/kpis56nx_spleen_sr2
+```
+
+Replace `smoke` with `all` for the full 24-epoch run. SR2 outputs are isolated
+under `sr2_shared_al_cnn3_lambda1/` (or `smoke_sr2_shared_al_lambda1/`) so they
+cannot overwrite the naive baseline.

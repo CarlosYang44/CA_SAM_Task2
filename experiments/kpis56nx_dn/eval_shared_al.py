@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from data_loader import get_loader  # noqa: E402
 from segment_anything import sam_model_registry  # noqa: E402
-from train_align_CL_VAE import build_align_module, evaluate  # noqa: E402
+from train_align_CL_VAE import build_align_module, evaluate, set_training_seed  # noqa: E402
 from utils import FocalDiceloss_IoULoss  # noqa: E402
 
 
@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--image-size", type=int, default=1024)
     parser.add_argument("--mask-num", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--multimask", action="store_true")
     return parser.parse_args()
@@ -58,6 +59,7 @@ def atomic_json(path: Path, payload: object) -> None:
 
 def main() -> int:
     args = parse_args()
+    set_training_seed(args.seed)
     args.test_mode = True
     args.dataset_scale = 1.0
     args.dist = False
@@ -96,7 +98,7 @@ def main() -> int:
     payload = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "dataset": args.dataset_name, "align_checkpoint": str(align_checkpoint),
-        "router": "disabled", "loss": loss,
+        "router": "disabled", "seed": args.seed, "loss": loss,
         "metrics": dict(zip(args.metrics, values)), "evaluated_samples": len(loader.dataset),
     }
     atomic_json(args.output.resolve(), payload)

@@ -102,6 +102,15 @@ def parse_args():
     parser.add_argument("--k_folds", type=int, default=5, help="Number of K-fold splits for tau calibration")
     parser.add_argument("--fold_seed", type=int, default=2025, help="Random seed for tau K-fold calibration")
     parser.add_argument("--tau_k_std", type=float, default=2.0, help="k in the tau statistic mu + k*sigma")
+    parser.add_argument("--seed", type=int, default=42, help="Training random seed")
+    parser.add_argument(
+        "--sr2_teacher_checkpoint", type=str, default=None,
+        help="Frozen previous Alignment Layer used for SR2-style relation alignment.",
+    )
+    parser.add_argument(
+        "--sr2_lambda", type=float, default=1.0,
+        help="Weight of the sample-wise singular-value relation alignment loss.",
+    )
 
     return parser.parse_args()
 
@@ -132,6 +141,33 @@ def build_align_module(args):
         return AlignTransformerPlus()
     else:
         raise ValueError(f"Unknown method: {args.method}")
+
+
+def set_training_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def sr2_relation_loss(current_features, teacher_features):
+    """Align sample-wise singular values of inter-layer cosine relations."""
+    if len(current_features) != len(teacher_features) or len(current_features) < 2:
+        raise ValueError("SR2 requires matching representations from at least two layers")
+
+    def relation_singular_values(features):
+        representations = torch.stack(
+            [F.normalize(feature.float().flatten(1), p=2, dim=1) for feature in features],
+            dim=1,
+        )
+        relations = torch.bmm(representations, representations.transpose(1, 2))
+        return torch.linalg.svdvals(relations)
+
+    current_values = relation_singular_values(current_features)
+    with torch.no_grad():
+        teacher_values = relation_singular_values(teacher_features)
+    return F.smooth_l1_loss(current_values, teacher_values, reduction="mean")
 
 
 def _repeat_to_match_batch(x, target_B):
@@ -293,12 +329,13 @@ def _tau_value_from_stats(stats, fallback: float) -> float:
     return float(fallback)
 
 
-def train_one_epoch(args, sam, align_module, optimizer, train_loader, epoch, criterion_seg, criterion_distill, loggers):
+def train_one_epoch(args, sam, align_module, optimizer, train_loader, epoch, criterion_seg, criterion_distill, loggers, sr2_teacher=None):
     sam.eval()
     align_module.train()
 
     train_loader = tqdm(train_loader, desc=f"Train Epoch {epoch+1}")
     train_losses = []
+    relation_losses = []
     train_iter_metrics = [0] * len(args.metrics)
 
     for it, batched_input in enumerate(train_loader):
@@ -314,7 +351,18 @@ def train_one_epoch(args, sam, align_module, optimizer, train_loader, epoch, cri
 
         labels = batched_input["label"]
         image_embeddings_ori = sam.image_encoder(batched_input["image"])
-        image_embeddings_base = align_module(image_embeddings_ori)
+        if sr2_teacher is not None:
+            image_embeddings_base, current_features = align_module.forward_with_intermediates(
+                image_embeddings_ori
+            )
+            with torch.no_grad():
+                _, teacher_features = sr2_teacher.forward_with_intermediates(
+                    image_embeddings_ori
+                )
+            loss_relation = sr2_relation_loss(current_features, teacher_features)
+        else:
+            image_embeddings_base = align_module(image_embeddings_ori)
+            loss_relation = image_embeddings_base.new_zeros(())
 
         loss_distill = 0.0
         if args.distill:
@@ -358,12 +406,15 @@ def train_one_epoch(args, sam, align_module, optimizer, train_loader, epoch, cri
             loss = 0.3 * loss_seg + 0.7 * loss_distill
         else:
             loss = loss_seg
+        if sr2_teacher is not None:
+            loss = loss + args.sr2_lambda * loss_relation
 
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         train_losses.append(loss.item())
+        relation_losses.append(loss_relation.item())
 
 
         cal_m_preds  = (masks  > 0.0)
@@ -379,7 +430,8 @@ def train_one_epoch(args, sam, align_module, optimizer, train_loader, epoch, cri
     l = len(train_loader)
     avg_loss = float(np.mean(train_losses)) if train_losses else 0.0
     avg_metrics = [m / l for m in train_iter_metrics] if l > 0 else [0.0] * len(args.metrics)
-    return avg_loss, avg_metrics
+    avg_relation_loss = float(np.mean(relation_losses)) if relation_losses else 0.0
+    return avg_loss, avg_metrics, avg_relation_loss
 
 
 @torch.no_grad()
@@ -440,6 +492,8 @@ def evaluate(args, sam, align_module, test_loader, criterion_seg, epoch):
 
 def main(args):
 
+    set_training_seed(args.seed)
+
     if args.batch_size is not None:
         if args.train_batch_size is None: args.train_batch_size = args.batch_size
         if args.eval_batch_size  is None: args.eval_batch_size  = args.batch_size
@@ -474,6 +528,22 @@ def main(args):
         align_module.load_state_dict(ckpt, strict=True)
         print(f"[Align] Loaded align checkpoint from: {args.align_checkpoint}")
 
+    sr2_teacher = None
+    if args.sr2_teacher_checkpoint:
+        if args.method != "cnn":
+            raise ValueError("SR2-style relation alignment currently supports --method cnn only")
+        if not args.align_checkpoint:
+            raise ValueError("SR2 requires --align_checkpoint for the current Alignment Layer")
+        if not os.path.isfile(args.sr2_teacher_checkpoint):
+            raise FileNotFoundError(args.sr2_teacher_checkpoint)
+        sr2_teacher = build_align_module(args).to(args.device)
+        teacher_ckpt = torch.load(args.sr2_teacher_checkpoint, map_location=args.device)
+        sr2_teacher.load_state_dict(teacher_ckpt, strict=True)
+        sr2_teacher.eval()
+        for parameter in sr2_teacher.parameters():
+            parameter.requires_grad = False
+        print(f"[SR2] Loaded frozen teacher from: {args.sr2_teacher_checkpoint}")
+
 
     optimizer = optim.Adam([p for p in align_module.parameters() if p.requires_grad], lr=args.lr)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[5, 10], gamma=0.5) if args.lr_scheduler else None
@@ -484,6 +554,9 @@ def main(args):
     loggers.info(f"Training started at {now_str}")
     loggers.info(f"Learning rate: {args.lr}")
     loggers.info(f"Trainable parameters: {trainable_params}")
+    loggers.info(f"Training seed: {args.seed}")
+    if sr2_teacher is not None:
+        loggers.info(f"SR2 relation alignment: lambda={args.sr2_lambda}")
 
 
     criterion_seg = FocalDiceloss_IoULoss()
@@ -494,9 +567,9 @@ def main(args):
     for epoch in range(args.epochs):
         start_t = time.time()
 
-        train_loss, train_metrics = train_one_epoch(
+        train_loss, train_metrics, relation_loss = train_one_epoch(
             args, sam, align_module, optimizer, train_loader, epoch,
-            criterion_seg, criterion_dist, loggers
+            criterion_seg, criterion_dist, loggers, sr2_teacher=sr2_teacher
         )
         test_loss, test_metrics = evaluate(args, sam, align_module, test_loader, criterion_seg, epoch)
         last_test_loss, last_test_metrics = test_loss, test_metrics
@@ -505,6 +578,7 @@ def main(args):
         lr_now = optimizer.param_groups[0]['lr']
         msg = (f"[Epoch {epoch+1}] lr={lr_now:.6f} "
                f"Train loss={train_loss:.4f} " + " ".join([f"train_{m}={train_metrics[i]:.4f}" for i, m in enumerate(args.metrics)]) +
+               f" | SR2 relation={relation_loss:.6f}"
                f" | Test loss={test_loss:.4f} " + " ".join([f"test_{m}={test_metrics[i]:.4f}" for i, m in enumerate(args.metrics)]))
         loggers.info(msg); print(msg)
 

@@ -32,11 +32,18 @@ class AlignCNN(nn.Module):
         self.norm = LayerNorm2d(dim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.forward_with_intermediates(x)
+        return x
+
+    def forward_with_intermediates(self, x: torch.Tensor):
+        """Return the aligned feature and each normalized block representation."""
         # x : shape [B, D, H, W]
+        intermediates = []
         for layer in self.layers:
             x = layer(x)
             x = self.norm(x)
-        return x
+            intermediates.append(x)
+        return x, intermediates
 
 
 class Align_New(nn.Module):
